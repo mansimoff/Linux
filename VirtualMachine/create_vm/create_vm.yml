@@ -1,0 +1,220 @@
+---
+# Автоматическое создание тестовой VM на локальном KVM/libvirt из
+# установочного ISO Rocky Linux 9.x / 10.x, без интерактивной установки
+# (Kickstart), сразу с нужным пользователем и SSH-доступом по ключу.
+#
+# Использование:
+#   1. Отредактировать vars.yml (имя, cpu, ram, диск, путь до ISO,
+#      ssh-ключ, хеш пароля — openssl passwd -6 'пароль')
+#   2. ansible-playbook -i inventory.yml create_vm.yml -e @vars.yml -K
+#
+# Требуются пакеты на хосте: qemu-kvm, libvirt, virt-install, genisoimage.
+
+- hosts: all
+  gather_facts: false
+  become: true
+  vars_files:
+    - vars.yml
+    
+  vars:
+    workdir: "/tmp/kvm-create-vm"
+    images_dir: /var/lib/libvirt/images
+    iso_path: /home/ruslanm/Downloads/OS/RHEL/Rocky-9.5-x86_64-minimal.iso
+  
+  environment:
+    # форсируем англоязычные сообщения virsh независимо от локали хоста —
+    # иначе матчинг строк вида "Active: no" ниже будет ненадёжным
+    LC_ALL: C
+    LANG: C 
+
+  tasks:
+    - name: Проверить обязательные переменные
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined
+          - vm_memory_mb is defined
+          - vm_vcpus is defined
+          - vm_disk_size is defined
+          - iso_path is defined
+          - ssh_pub_key is defined
+          - vm_password_hash is defined
+        fail_msg: "Заполните vars.yml: vm_name, vm_memory_mb, vm_vcpus, vm_disk_size, iso_path, ssh_pub_key, vm_password_hash"
+
+    - name: Проверить, что ISO существует
+      ansible.builtin.stat:
+        path: "{{ iso_path }}"
+      register: iso_stat
+      failed_when: not iso_stat.stat.exists
+
+    - name: Проверить, что такой VM ещё нет
+      ansible.builtin.command: virsh dominfo {{ vm_name }}
+      register: vm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Прервать, если VM с таким именем уже существует
+      ansible.builtin.fail:
+        msg: "VM '{{ vm_name }}' уже существует (virsh undefine --remove-all-storage {{ vm_name }}, чтобы удалить)"
+      when: vm_check.rc == 0
+
+    - name: Проверить состояние сети {{ vm_network | default('default') }}
+      ansible.builtin.command: virsh net-info {{ vm_network | default('default') }}
+      register: net_info
+      become: true
+      changed_when: false
+
+    - name: Запустить сеть {{ vm_network | default('default') }}, если она не активна
+      ansible.builtin.command: virsh net-start {{ vm_network | default('default') }}
+      become: true
+      when: "'Active:         no' in net_info.stdout"
+
+    - name: Показать конфигурацию новой VM
+      ansible.builtin.debug:
+        msg:
+          - "Имя VM:           {{ vm_name }}"
+          - "CPU:              {{ vm_vcpus }}"
+          - "RAM:              {{ vm_memory_mb }} MB"
+          - "Диск:             {{ vm_disk_size }}"
+          - "ISO:              {{ iso_path }}"
+          - "Пользователь:     {{ vm_user | default('admin') }}"
+          - "SSH-ключ:         {{ ssh_pub_key }}"
+          - "Сеть:             {{ vm_network | default('default') }}"
+          - "os-variant:       {{ os_variant | default('generic') }}"
+          - "Каталог дисков:   {{ images_dir }}"
+ 
+    - name: Подтверждение
+      ansible.builtin.pause:
+        prompt: "Продолжить создание VM с указанными параметрами? (yes/no)"
+      register: confirm
+
+    - name: Прервать, если не подтверждено
+      ansible.builtin.fail:
+        msg: "Отменено пользователем."
+      when: confirm.user_input | lower not in ['yes', 'y', 'да']
+
+
+    - name: Каталог для дисков/ISO 
+      ansible.builtin.file:
+        path: "{{ images_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Рабочая директория для ks.cfg 
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: "0700"
+      
+
+    - name: Создать диск VM
+      ansible.builtin.command: >
+        qemu-img create -f qcow2 {{ images_dir }}/{{ vm_name }}.qcow2 {{ vm_disk_size }}
+
+    - name: Сгенерировать kickstart-файл (ks.cfg)
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/{{ vm_name }}-ks.cfg"
+        mode: "0644"
+        content: |
+          lang en_US.UTF-8
+          keyboard us
+          timezone {{ timezone | default('UTC') }} --utc
+          rootpw --lock
+          user --name={{ vm_user | default('admin') }} --iscrypted --password={{ vm_password_hash }} --groups=wheel
+          sshkey --username={{ vm_user | default('admin') }} "{{ ssh_pub_key }}"
+
+          network --bootproto=dhcp --activate --hostname={{ vm_name }}
+          firewall --enabled --service=ssh
+          selinux --enforcing
+
+          zerombr
+          clearpart --all --initlabel
+          autopart --type=lvm --fstype=xfs
+          bootloader --location=mbr
+
+          reboot
+
+          %packages --ignoremissing
+          @^minimal-environment
+          openssh-server
+          %end
+
+          %post
+          echo "{{ vm_user | default('admin') }} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/{{ vm_user | default('admin') }}
+          chmod 440 /etc/sudoers.d/{{ vm_user | default('admin') }}
+          systemctl enable sshd
+          %end
+
+    - name: Собрать OEMDRV-ISO с kickstart-файлом
+      ansible.builtin.command: >
+        genisoimage -output {{ images_dir }}/{{ vm_name }}-oemdrv.iso
+        -volid OEMDRV -joliet -rock
+        {{ workdir }}/{{ vm_name }}-ks.cfg
+
+    - name: Удалить временный ks.cfg (пароль-хеш/ключ уже упакованы в ISO)
+      ansible.builtin.file:
+        path: "{{ workdir }}/{{ vm_name }}-ks.cfg"
+        state: absent
+
+    - name: Запустить unattended-установку через virt-install
+      ansible.builtin.command: >
+        virt-install
+        --name {{ vm_name }}
+        --memory {{ vm_memory_mb }}
+        --vcpus {{ vm_vcpus }}
+        --disk path={{ images_dir }}/{{ vm_name }}.qcow2,bus=virtio
+        --disk path={{ images_dir }}/{{ vm_name }}-oemdrv.iso,device=cdrom
+        --location {{ iso_path }}
+        --extra-args "inst.ks=hd:LABEL=OEMDRV:/{{ vm_name }}-ks.cfg console=ttyS0,115200n8 inst.text"
+        --os-variant {{ os_variant | default('generic') }}
+        --network network={{ vm_network | default('default') }},model=virtio
+        --graphics none
+        --noautoconsole
+        --wait -1
+      # --wait -1: ждать здесь же, пока не завершится установка и гость не
+      # перезагрузится в финальную ОС. Без этого virt-install выходит сразу
+      # после старта установки, некому обработать финальный reboot — и VM
+      # просто гаснет вместо того, чтобы остаться работающей.
+
+    - name: Определить target-устройство OEMDRV-ISO
+      ansible.builtin.shell: >
+        virsh domblklist {{ vm_name }} --details | awk -v f="{{ vm_name }}-oemdrv.iso" '$0 ~ f {print $3}'
+      register: oemdrv_target
+      changed_when: false
+
+    - name: Отключить и удалить OEMDRV-ISO (больше не нужен после установки)
+      when: oemdrv_target.stdout | trim != ''
+      become: true
+      block:
+        - name: Извлечь ISO с kickstart из cdrom (IDE не поддерживает live detach самого привода)
+          ansible.builtin.command: >
+            virsh change-media {{ vm_name }} {{ oemdrv_target.stdout | trim }} --eject --live --config
+        - name: Удалить файл {{ vm_name }}-oemdrv.iso
+          ansible.builtin.file:
+            path: "{{ images_dir }}/{{ vm_name }}-oemdrv.iso"
+            state: absent
+
+    - name: Получить IP-адрес VM
+      ansible.builtin.command: virsh domifaddr {{ vm_name }}
+      register: vm_ip_check
+      retries: 20
+      delay: 10
+      until: "'ipv4' in vm_ip_check.stdout"
+      changed_when: false
+
+    - name: Извлечь IP из вывода virsh domifaddr
+      ansible.builtin.set_fact:
+        vm_ip: "{{ (vm_ip_check.stdout | regex_search('ipv4\\s+([0-9.]+)/', '\\1'))[0] }}"
+
+    - name: Добавить/обновить запись {{ vm_name }} в /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '.*\s{{ vm_name }}$'
+        line: "{{ vm_ip }}\t{{ vm_name }}"
+        state: present
+
+    - name: Итог
+      ansible.builtin.debug:
+        msg:
+          - "VM '{{ vm_name }}' установлена и запущена."
+          - "IP: {{ vm_ip }}"
+          - "Подключение: ssh {{ vm_user | default('admin') }}@{{ vm_name }}"

@@ -1,0 +1,4 @@
+all:
+  hosts:
+    test-vm9-5:
+      ansible_connection: local

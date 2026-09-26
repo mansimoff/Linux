@@ -1,0 +1,20 @@
+# --- Обязательные параметры ---
+
+vm_name: test-vm9-5
+vm_memory_mb: 1024
+vm_vcpus: 1
+vm_disk_size: 5G
+
+# Публичный SSH-ключ пользователя
+ssh_pub_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHb280n2BGyiweABM"
+
+# Хеш пароля (НЕ сам пароль). Сгенерировать:
+#   openssl passwd -6 'мойпароль'
+vm_password_hash: "$6$/OpiJfO6ZvGg0qMb/Hrpg08.WHMCwctnw7IwQfcOz1"
+
+# --- Необязательные параметры ---
+
+vm_user: ruslanm              # пользователь внутри VM, добавляется в wheel + sudo NOPASSWD
+vm_network: default         # имя libvirt-сети
+os_variant: generic         # rocky9 / rocky10, если есть в `osinfo-query os`; иначе generic
+timezone: Europe/Moscow
